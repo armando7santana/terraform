@@ -5,9 +5,18 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/hashicorp/hcl2/hcl"
+	"github.com/hashicorp/hcl2/hcldec"
+	"github.com/hashicorp/hcl2/hcltest"
+	"github.com/hashicorp/terraform/command/format"
+	"github.com/zclconf/go-cty/cty"
+
 	"github.com/hashicorp/terraform/backend"
 	"github.com/hashicorp/terraform/config"
 	"github.com/hashicorp/terraform/config/module"
+	"github.com/hashicorp/terraform/diffs"
+	"github.com/hashicorp/terraform/plugin/discovery"
+	"github.com/hashicorp/terraform/terraform"
 	"github.com/hashicorp/terraform/tfdiags"
 )
 
@@ -18,6 +27,153 @@ type PlanCommand struct {
 }
 
 func (c *PlanCommand) Run(args []string) int {
+	args, err := c.Meta.process(args, true)
+	if err != nil {
+		return 1
+	}
+
+	fmt.Printf("temporary plan\n\n")
+
+	reqd := discovery.PluginRequirements{
+		"aws": &discovery.PluginConstraints{
+			Versions: discovery.ConstraintStr(">= 0.0.0").MustParse(),
+		},
+	}
+
+	providerResolver := c.providerResolver()
+	factories, errs := providerResolver.ResolveProviders(reqd)
+	if len(errs) > 0 {
+		c.showDiagnostics(errs[0])
+		return 1
+	}
+
+	provider, err := factories["aws"]()
+	if err != nil {
+		c.showDiagnostics(err)
+		return 1
+	}
+
+	schema, err := provider.GetSchema(&terraform.ProviderSchemaRequest{
+		ResourceTypes: []string{"aws_instance"},
+	})
+	if err != nil {
+		c.showDiagnostics(err)
+		return 1
+	}
+
+	rSchema := schema.ResourceTypes["aws_instance"]
+	//ty := rSchema.ImpliedType()
+
+	addr, _ := terraform.ParseResourceAddress("aws_instance.example")
+
+	oldBody := hcltest.MockBody(&hcl.BodyContent{
+		Attributes: hcl.Attributes{
+			"ami": {
+				Name: "ami",
+				Expr: hcltest.MockExprLiteral(cty.StringVal("ami-abcd")),
+			},
+			"instance_type": {
+				Name: "instance_type",
+				Expr: hcltest.MockExprLiteral(cty.StringVal("z1.weedy")),
+			},
+			"ebs_optimized": {
+				Name: "ebs_optimized",
+				Expr: hcltest.MockExprLiteral(cty.True),
+			},
+			"iam_instance_profile": {
+				Name: "iam_instance_profile",
+				Expr: hcltest.MockExprLiteral(cty.NullVal(cty.String)),
+			},
+			"user_data": {
+				Name: "user_data",
+				Expr: hcltest.MockExprLiteral(cty.StringVal("#!/usr/bin/bash\necho howdy\ncat /etc/foo")),
+			},
+			"vpc_security_group_ids": {
+				Name: "vpc_security_group_ids",
+				Expr: hcltest.MockExprLiteral(cty.SetVal([]cty.Value{
+					cty.StringVal("sg-12354"),
+				})),
+			},
+		},
+		Blocks: hcl.Blocks{
+			&hcl.Block{
+				Type: "root_block_device",
+				Body: hcltest.MockBody(&hcl.BodyContent{
+					Attributes: hcl.Attributes{
+						"volume_type": {
+							Name: "volume_type",
+							Expr: hcltest.MockExprLiteral(cty.StringVal("standard")),
+						},
+					},
+				}),
+			},
+		},
+	})
+	newBody := hcltest.MockBody(&hcl.BodyContent{
+		Attributes: hcl.Attributes{
+			"ami": {
+				Name: "ami",
+				Expr: hcltest.MockExprLiteral(cty.StringVal("ami-1234")),
+			},
+			"instance_type": {
+				Name: "instance_type",
+				Expr: hcltest.MockExprLiteral(cty.StringVal("z5.funky")),
+			},
+			"ebs_optimized": {
+				Name: "ebs_optimized",
+				Expr: hcltest.MockExprLiteral(cty.False),
+			},
+			"user_data": {
+				Name: "user_data",
+				Expr: hcltest.MockExprLiteral(cty.StringVal("#!/usr/bin/bash\necho hello\ncat /etc/foo")),
+			},
+			"iam_instance_profile": {
+				Name: "iam_instance_profile",
+				Expr: hcltest.MockExprLiteral(cty.StringVal("arn:aws:foobarbaz")),
+			},
+			"vpc_security_group_ids": {
+				Name: "vpc_security_group_ids",
+				Expr: hcltest.MockExprLiteral(cty.SetVal([]cty.Value{
+					cty.StringVal("sg-12354"),
+					cty.StringVal("sg-abcde"),
+				})),
+			},
+		},
+		Blocks: hcl.Blocks{
+			&hcl.Block{
+				Type: "root_block_device",
+				Body: hcltest.MockBody(&hcl.BodyContent{
+					Attributes: hcl.Attributes{
+						"volume_type": {
+							Name: "volume_type",
+							Expr: hcltest.MockExprLiteral(cty.StringVal("gp2")),
+						},
+					},
+				}),
+			},
+		},
+	})
+
+	old, diags := hcldec.Decode(oldBody, rSchema.DecoderSpec(), nil)
+	c.showDiagnostics(diags)
+	if diags.HasErrors() {
+		return 1
+	}
+	new, diags := hcldec.Decode(newBody, rSchema.DecoderSpec(), nil)
+	c.showDiagnostics(diags)
+	if diags.HasErrors() {
+		return 1
+	}
+
+	change := diffs.NewUpdate(old, new)
+
+	diff := format.ResourceChange(addr, change, rSchema, c.Colorize())
+	fmt.Println(diff)
+
+	return 0
+}
+
+func (c *PlanCommand) NormalRun(args []string) int {
 	var destroy, refresh, detailed bool
 	var outPath string
 	var moduleDepth int
